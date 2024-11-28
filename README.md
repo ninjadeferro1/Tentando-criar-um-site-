@@ -1,170 +1,239 @@
-# Tentando-criar-um-site-
-Tentando criar um site 
-Aqui está o script completo:
 
-*Estrutura Básica*
+1. Arquivo .env
 
-```
+OPENAI_API_KEY=your_openai_api_key
+DB_URI=mongodb://localhost:27017/seu_banco
+
+2. Configuração do i18next (i18n.js)
+
+// config/i18n.js
+const i18next = require('i18next');
+const Backend = require('i18next-fs-backend');
+const LanguageDetector = require('i18next-http-middleware').LanguageDetector;
+
+i18next
+  .use(Backend)
+  .use(LanguageDetector)
+  .init({
+    fallbackLng: 'pt',
+    preload: ['en', 'pt'],
+    backend: {
+      loadPath: './locales/{{lng}}/{{ns}}.json',
+    },
+    detection: {
+      order: ['cookie', 'header'],
+      caches: ['cookie'],
+    },
+  });
+
+module.exports = i18next;
+
+3. Servidor Express (app.js)
+
+// app.js
 const express = require('express');
-const app = express();
-const porta = 3000;
-
-const mongoose = require('mongoose');
-const tf = require('@tensorflow/tfjs');
-const PagBank = require('pagbank');
-const passport = require('passport');
-const jwt = require('jsonwebtoken');
-const Joi = require('joi');
-const Sanitizer = require('sanitizer');
 const helmet = require('helmet');
+const csrf = require('csurf');
 const rateLimit = require('express-rate-limit');
-```
+const i18nextMiddleware = require('i18next-http-middleware');
+const i18n = require('./config/i18n');
+const perguntaRoutes = require('./routes/perguntaRoutes');
+const AppError = require('./utils/AppError');
+const AiError = require('./utils/AiError');
+const path = require('path');
+const cookieParser = require('cookie-parser');
+require('dotenv').config();
 
-*Conexão com Banco de Dados*
+const app = express();
 
-```
-mongoose.connect('mongodb://localhost/gg_perfumes', {
-  useNewUrlParser: true,
-  useUnifiedTopology: true
-});
-```
-
-*Configuração*
-
-```
+// Middleware
 app.use(express.json());
 app.use(helmet());
-app.use(rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 100
-}));
-app.use(passport.initialize());
-```
+app.use(cookieParser());
+app.use(i18nextMiddleware.handle(i18n));
 
-*Autenticação*
+// Serve arquivos estáticos da pasta 'public'
+app.use(express.static(path.join(__dirname, 'public')));
 
-```
-passport.use(new passport.LocalStrategy({
-  usernameField: 'email',
-  passwordField: 'senha'
-}, (email, senha, done) => {
-  // Verificar credenciais
-}));
-
-app.post('/login', passport.authenticate('local'), (req, res) => {
-  // Login
+// Configuração de segurança
+const csrfProtection = csrf({ cookie: true });
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutos
+  max: 100, // limita cada IP a 100 requisições por janela
 });
 
-app.post('/cadastro', (req, res) => {
-  // Cadastrar usuário
-});
-```
+app.use(csrfProtection);
+app.use(limiter);
 
-*Validar Dados de Entrada*
+// Rotas
+app.use('/pergunta', perguntaRoutes);
 
-```
-const schema = Joi.object({
-  nome: Joi.string().required(),
-  email: Joi.string().email().required(),
-  senha: Joi.string().min(8).required(),
-  preco: Joi.number().required(),
-  descricao: Joi.string().required()
-});
-```
-
-*Rotas*
-
-```
-// Rota de pagamento
-app.post('/pagamento', (req, res) => {
-  // Processar pagamento
+app.get('/', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'index.html'), { csrfToken: req.csrfToken() });
 });
 
-// Rota de recuperação de senha
-app.post('/recuperar-senha', (req, res) => {
-  // Recuperar senha
+// Tratamento de erros
+app.use((err, req, res, next) => {
+  if (err instanceof AppError) {
+    return res.status(err.statusCode).json({ status: 'erro', mensagem: err.message });
+  }
+  if (err instanceof AiError) {
+    return res.status(err.statusCode).json({ status: 'erro', mensagem: err.message });
+  }
+  console.error(err);
+  res.status(500).json({ status: 'erro', mensagem: 'Erro interno no servidor.' });
 });
 
-// Rota de edição de perfil
-app.put('/editar-perfil', (req, res) => {
-  // Editar perfil
-});
+module.exports = app;
 
-// Rota de histórico de transações
-app.get('/historico-transacoes', (req, res) => {
-  // Histórico de transações
-});
+4. Rota de Pergunta (perguntaRoutes.js)
 
-// Rota de notificações
-app.get('/notificacoes', (req, res) => {
-  // Notificações
-});
+// routes/perguntaRoutes.js
+const express = require('express');
+const { body } = require('express-validator');
+const validateWithYup = require('../middlewares/validateWithYup');
+const handleValidationErrors = require('../middlewares/handleValidationErrors');
+const perguntaSchema = require('../schemas/perguntaSchema');
+const { openAiChat } = require('../utils/openAi');
+const { User } = require('../models/User');
 
-// Rota de busca
-app.get('/busca', (req, res) => {
-  // Busca
-});
+const router = express.Router();
 
-// Rota de filtragem
-app.get('/filtragem', (req, res) => {
-  // Filtragem
-});
+// Rota de validação de pergunta
+router.post(
+  '/',
+  [
+    body('email')
+      .isEmail()
+      .withMessage(i18n.t('error_required'))
+      .custom(async (value) => {
+        const userExists = await User.findOne({ email: value });
+        if (userExists) {
+          throw new Error(i18n.t('error_email_exists'));
+        }
+        return true;
+      }),
+  ],
+  handleValidationErrors,
+  validateWithYup(perguntaSchema),
+  (req, res) => {
+    res.status(200).json({ mensagem: 'Validação concluída com sucesso.', dados: req.body });
+  }
+);
 
-// Rota de paginação
-app.get('/paginacao', (req, res) => {
-  // Paginação
-});
-
-// Rota de gerenciamento de perfis
-app.get('/gerenciar-perfis', (req, res) => {
-  // Gerenciar perfis
-});
-
-// Rota de integração social
-app.get('/integracao-social', (req, res) => {
-  // Integração social
-});
-```
-
-*Modelo de IA*
-
-```
-// Criar modelo de IA
-const modelo = tf.sequential();
-modelo.add(tf.layers.dense({ units: 128, activation: 'relu', inputShape: [1] }));
-modelo.add(tf.layers.dense({ units: 64, activation: 'relu' }));
-modelo.add(tf.layers.dense({ units: 1, activation: 'sigmoid' }));
-modelo.compile({
-  optimizer: tf.optimizers.adam(0.001),
-  loss: 'binaryCrossentropy',
-  metrics: ['accuracy', 'precision', 'recall']
-});
-
-// Treinar modelo
-const dadosTreinamento = tf.tensor([[10], [20], [30], [40], [50]]);
-const rotulosTreinamento = tf.tensor([[0], [1], [0], [1], [0]]);
-modelo.fit(dadosTreinamento, rotulosTreinamento, {
-  epochs: 500,
-  validationSplit: 0.2,
-  callbacks: {
-    onEpochEnd: (epoch, logs) => console.log(`Época ${epoch}: Perda=${logs.loss.toFixed(4)}, Precisão=${logs.accuracy.toFixed(4)}`)
+// Rota de interação com a IA
+router.post('/interagir-com-ia', async (req, res, next) => {
+  try {
+    const resposta = await openAiChat(req.body.mensagem);
+    res.status(200).json({ resposta });
+  } catch (err) {
+    next(new AiError('Erro ao interagir com a IA', 500));
   }
 });
-```
 
-*Segurança*
+module.exports = router;
 
-```
-// Proteger contra ataques CSRF
-app.use((req, res, next) => {
-  res.header('Access-Control-Allow-Origin', '*');
-  res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept');
+5. Função OpenAI (openAi.js)
+
+// utils/openAi.js
+const axios = require('axios');
+
+// Função para interagir com a OpenAI (assistente "Gracielle")
+const openAiChat = async (mensagem) => {
+  const prompt = `Atue como um assistente de atendimento ao cliente da loja G&G Perfumes e Cosméticos, chamada Gracielle. Responda a seguinte pergunta: ${mensagem}`;
+  try {
+    const resposta = await axios.post('https://api.openai.com/v1/completions', {
+      model: 'gpt-3.5-turbo',  // Atualizado para o modelo mais recente
+      prompt: prompt,
+      max_tokens: 150,
+    }, {
+      headers: {
+        'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`,
+      },
+    });
+    return resposta.data.choices[0].text.trim();
+  } catch (error) {
+    throw new AiError('Erro ao interagir com a IA', 500);
+  }
+};
+
+module.exports = { openAiChat };
+
+6. Middleware de Validação de Erros (handleValidationErrors.js)
+
+// middlewares/handleValidationErrors.js
+const { validationResult } = require('express-validator');
+
+// Middleware para tratar erros de validação
+const handleValidationErrors = (req, res, next) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) {
+    return res.status(400).json({ erros: errors.array().map(err => err.msg) });
+  }
   next();
+};
+
+module.exports = handleValidationErrors;
+
+7. Validação com Yup (validateWithYup.js)
+
+// middlewares/validateWithYup.js
+const validateWithYup = (schema) => {
+  return async (req, res, next) => {
+    try {
+      await schema.validate(req.body, { abortEarly: false });
+      next();
+    } catch (err) {
+      return res.status(400).json({ erros: err.errors });
+    }
+  };
+};
+
+module.exports = validateWithYup;
+
+8. Modelo de Usuário (User.js)
+
+// models/User.js
+const mongoose = require('mongoose');
+
+const userSchema = new mongoose.Schema({
+  email: { type: String, required: true, unique: true },
+  nome: { type: String, required: true },
+  senha: { type: String, required: true },
 });
 
-// Validar e sanitizar dados de entrada
-app.use((req, res, next) => {
-  const { error } = schema.validate(req.body);
-  if (error) {
-    return
-```
+const User = mongoose.model('User', userSchema);
+module.exports = { User };
+
+9. Arquivos de Tradução (locales/pt/translation.json)
+
+// locales/pt/translation.json
+{
+  "error_required": "Este campo é obrigatório.",
+  "error_email_exists": "Este e-mail já está registrado.",
+  "error_past_date": "A data não pode ser no passado.",
+  "error_invalid_status": "Status inválido.",
+  "error_invalid_cpf": "CPF inválido"
+}
+
+10. HTML (index.html)
+
+<!-- public/index.html -->
+<!DOCTYPE html>
+<html lang="pt">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>G&G Perfumes e Cosméticos</title>
+  <link rel="stylesheet" href="assets/styles.css">
+  <meta name="csrf-token" content="{{csrfToken}}">
+</head>
+<body>
+  <header>
+    <img src="assets/images/logo.png" alt="G&G Perfumes e Cosméticos">
+  </header>
+</body>
+</html>
+
+
+
